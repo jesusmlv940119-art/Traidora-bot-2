@@ -1,0 +1,104 @@
+import asyncio, os
+from datetime import datetime
+from metaapi_cloud_sdk import MetaApi
+
+TOKEN = os.environ["META_TOKEN"]
+ACCOUNT = "9680b322-ccdd-41de-9e03-422694ee7b89"
+SYMBOL = "GBPUSDm"
+LOT = 0.01
+SL = 15
+TP = 25
+
+def log(m): print(f"[{datetime.now().strftime('%H:%M:%S')}] {m}", flush=True)
+
+def ema(p, n):
+    k = 2/(n+1)
+    e = sum(p[:n])/n
+    for x in p[n:]:
+        e = x*k + e*(1-k)
+    return e
+
+def rsi(p, n=14):
+    g = l = 0
+    for i in range(len(p)-n, len(p)):
+        d = p[i]-p[i-1]
+        if d > 0:
+            g += d
+        else:
+            l -= d
+    return 100 - 100/(1+g/(l or 1e-9))
+
+async def run():
+    log("Bot iniciando...")
+    api = MetaApi(TOKEN)
+    acc = await api.metatrader_account_api.get_account(ACCOUNT)
+
+    if acc.state != "DEPLOYED":
+        await acc.deploy()
+
+    log("Esperando conexion...")
+    await acc.wait_connected(timeout_in_seconds=120)
+
+    c = acc.get_rpc_connection()
+    await c.connect()
+    await c.wait_synchronized(timeout_in_seconds=120)
+    log("Conexion establecida!")
+
+    closes = []
+
+    while True:
+        try:
+            info = await c.get_account_information()
+            log(f"Balance: ${info['balance']:.2f}")
+
+            price = await c.get_symbol_price(SYMBOL)
+            bid = price["bid"]
+            ask = price["ask"]
+            closes.append((bid+ask)/2)
+
+            if len(closes) > 200:
+                closes = closes[-200:]
+
+            log(f"Precios acumulados: {len(closes)}/21")
+
+            if len(closes) >= 21:
+                e8 = ema(closes, 8)
+                e21 = ema(closes, 21)
+                r = rsi(closes)
+                log(f"EMA8:{e8:.5f} EMA21:{e21:.5f} RSI:{r:.1f}")
+
+                pos = await c.get_positions()
+                pip = 0.0001
+
+                buys = [p for p in pos if p["type"] == "POSITION_TYPE_BUY"]
+                sells = [p for p in pos if p["type"] == "POSITION_TYPE_SELL"]
+
+                if e8 > e21 and r < 65:
+                    if not buys:
+                        sl = bid - SL*pip
+                        tp_price = ask + TP*pip
+                        await c.create_market_buy_order(SYMBOL, LOT, sl, tp_price, {"comment":"ClaudeBot2"})
+                        log("BUY ejecutado!")
+                    else:
+                        log("HOLD - BUY ya abierto")
+
+                elif e8 < e21 and r > 35:
+                    if not sells:
+                        sl = ask + SL*pip
+                        tp_price = bid - TP*pip
+                        await c.create_market_sell_order(SYMBOL, LOT, sl, tp_price, {"comment":"ClaudeBot2"})
+                        log("SELL ejecutado!")
+                    else:
+                        log("HOLD - SELL ya abierto")
+
+                else:
+                    log("HOLD")
+
+        except Exception as e:
+            log(f"Error: {e}")
+            await asyncio.sleep(10)
+            continue
+
+        await asyncio.sleep(300)
+
+asyncio.run(run())
